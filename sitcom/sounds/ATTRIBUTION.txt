@@ -1,0 +1,2 @@
+Mixkit preview SFX (https://mixkit.co) used as temporary placeholders — replace with your own:
+  boo.wav, ooh.wav, trombone.wav, bonk.wav

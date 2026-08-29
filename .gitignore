@@ -1,0 +1,13 @@
+build/
+cmake-build-*/
+*.user
+*.suo
+.vs/
+.idea/
+sitcom/sitcom.log
+*.dll
+!sitcom/**
+__pycache__/
+.DS_Store
+build/
+dist/

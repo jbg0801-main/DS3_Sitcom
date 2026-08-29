@@ -1,0 +1,7 @@
+# Rename another mod's dinput8.dll (e.g. bbj.dll, nologo.dll) and list it below,
+# one path per line, relative to the game folder next to sitcom's dinput8.dll.
+# Lines starting with # or ; are ignored.
+#
+# Example:
+# bbj.dll
+# nologo.dll
