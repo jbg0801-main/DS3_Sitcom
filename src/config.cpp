@@ -106,6 +106,8 @@ bool LoadConfig(const std::wstring& ini_path, Config& out) {
   cfg.laugh_on_no_spell = ReadBool(L"events", L"laugh_on_no_spell", true, ini_path);
   cfg.laugh_on_ladder_fall = ReadBool(L"events", L"laugh_on_ladder_fall", true, ini_path);
 
+  cfg.probe_transitions = ReadBool(L"debug", L"probe_transitions", true, ini_path);
+
   cfg.laugh_hit_seconds = ReadFloat(L"cooldowns", L"laugh_hit_seconds", 1.5f, ini_path);
   cfg.ooh_cooldown_seconds = ReadFloat(L"cooldowns", L"ooh_cooldown_seconds", 0.75f, ini_path);
   cfg.sounds_dir = ReadString(L"paths", L"sounds_dir", "sounds", ini_path);

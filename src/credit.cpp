@@ -17,8 +17,8 @@ namespace {
 
 constexpr wchar_t kCreditTitle[] = L"Sitcom mod by jbg0801 2026";
 constexpr wchar_t kCreditDedication[] =
-    L"This mod is dedicated to my amazing mum. I lost her during the creation of this mod, "
-    L"and I'll never get to tell her about most of the projects I've worked on. "
+    L"This mod is dedicated to my amazing mum. I lost her during the creation of this mod,\n"
+    L"and I'll never get to tell her about most of the projects I've worked on.\n"
     L"I miss you mum. I love you, sleep well.";
 
 using PresentFn = HRESULT(__stdcall*)(IDXGISwapChain*, UINT, UINT);
@@ -100,7 +100,7 @@ bool RenderTextBitmap(std::vector<uint32_t>* out_bgra, int* out_w, int* out_h) {
   const int pad_x = 20;
   const int pad_y = 12;
   const int gap = 8;
-  const int canvas_w = 560;
+  const int canvas_w = 680;
 
   HGDIOBJ old_font = title_font ? SelectObject(hdc, title_font) : nullptr;
   SIZE title_sz{};
@@ -111,7 +111,7 @@ bool RenderTextBitmap(std::vector<uint32_t>* out_bgra, int* out_w, int* out_h) {
     SelectObject(hdc, body_font);
   }
   DrawTextW(hdc, kCreditDedication, -1, &body_measure,
-            DT_CALCRECT | DT_WORDBREAK | DT_NOPREFIX);
+            DT_CALCRECT | DT_WORDBREAK | DT_NOPREFIX | DT_NOCLIP);
   const int body_h = body_measure.bottom - body_measure.top;
   const int w = canvas_w;
   const int h = pad_y + title_sz.cy + gap + body_h + pad_y + 8;
@@ -161,7 +161,7 @@ bool RenderTextBitmap(std::vector<uint32_t>* out_bgra, int* out_w, int* out_h) {
     SelectObject(hdc, body_font);
   }
   DrawTextW(hdc, kCreditDedication, -1, &body_rc,
-            DT_WORDBREAK | DT_RIGHT | DT_NOPREFIX);
+            DT_WORDBREAK | DT_RIGHT | DT_NOPREFIX | DT_NOCLIP);
 
   if (old_font) {
     SelectObject(hdc, old_font);

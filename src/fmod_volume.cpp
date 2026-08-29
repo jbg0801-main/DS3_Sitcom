@@ -5,10 +5,12 @@
 #include <windows.h>
 
 #include <atomic>
+#include <cctype>
 #include <cmath>
 #include <cstring>
 #include <mutex>
 #include <string>
+#include <unordered_set>
 
 namespace sitcom {
 namespace {
@@ -29,10 +31,14 @@ using EventCategory = void;
 using FnGetCategory = FmodResult(__cdecl*)(EventSystem*, const char*, EventCategory**);
 using FnGetVolume = FmodResult(__cdecl*)(EventCategory*, float*);
 using FnCppUpdate = FmodResult(__cdecl*)(EventSystem* self);
+using FnEventStart = FmodResult(__cdecl*)(void* event, int paused, void** instance);
+using FnEventGetInfo = FmodResult(__cdecl*)(void* event, void* info, char* name, int namelen);
 
 FnGetCategory g_get_category = nullptr;
 FnGetVolume g_get_volume = nullptr;
 FnCppUpdate g_real_update = nullptr;
+FnEventStart g_real_event_start = nullptr;
+FnEventGetInfo g_event_get_info = nullptr;
 
 std::atomic<EventSystem*> g_event_system{nullptr};
 std::atomic<EventCategory*> g_se_category{nullptr};
@@ -41,8 +47,12 @@ std::atomic<bool> g_se_valid{false};
 std::atomic<bool> g_ready{false};
 std::atomic<bool> g_captured{false};
 std::atomic<bool> g_want_hook{false};
+std::atomic<bool> g_probe_transitions{false};
+std::atomic<bool> g_area_transition_pending{false};
+char g_area_transition_name[128]{};
 
 std::mutex g_hook_mu;
+std::mutex g_area_mu;
 
 struct InlineHook {
   void* target = nullptr;
@@ -51,6 +61,7 @@ struct InlineHook {
 };
 
 InlineHook g_update_hook;
+InlineHook g_event_start_hook;
 
 bool IsReadable(const void* p, size_t n = 8) {
   if (!p) {
@@ -131,21 +142,161 @@ bool TryReadSe(EventSystem* es) {
   return true;
 }
 
-void RestoreUpdatePrologue() {
-  if (!g_update_hook.active || !g_update_hook.target) {
+bool Strieq(const char* hay, const char* needle) {
+  if (!hay || !needle) {
+    return false;
+  }
+  const size_t nlen = std::strlen(needle);
+  if (nlen == 0) {
+    return true;
+  }
+  for (const char* p = hay; *p; ++p) {
+    size_t i = 0;
+    while (i < nlen && p[i] &&
+           std::tolower(static_cast<unsigned char>(p[i])) ==
+               std::tolower(static_cast<unsigned char>(needle[i]))) {
+      ++i;
+    }
+    if (i == nlen) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool LooksLikeAreaTransitionEvent(const char* name) {
+  if (!name || !name[0]) {
+    return false;
+  }
+  static const char* kNeedles[] = {
+      "location",   "area_title", "areatitle", "area_name", "map_title",  "maptitle",
+      "place_name", "placename",  "field_name", "landmark",  "region_name", "title_card",
+      "titlecard",  "map_name",   "mapname",    "area_card", "location_name",
+      "map_in",     "mapin",      "area_in",   "areain",    "enter",       "discovery",
+  };
+  for (const char* needle : kNeedles) {
+    if (Strieq(name, needle)) {
+      return true;
+    }
+  }
+  if ((name[0] == 'f' || name[0] == 'F' || name[0] == 's' || name[0] == 'S') &&
+      std::strchr(name, '_') &&
+      (Strieq(name, "title") || Strieq(name, "location") || Strieq(name, "land"))) {
+    return true;
+  }
+  return false;
+}
+
+void NoteAreaTransitionEvent(const char* name) {
+  if (!name || !name[0]) {
+    return;
+  }
+  {
+    std::lock_guard<std::mutex> lock(g_area_mu);
+    std::snprintf(g_area_transition_name, sizeof(g_area_transition_name), "%s", name);
+    g_area_transition_pending.store(true, std::memory_order_release);
+  }
+  LogWrite(std::string("fmod: area-transition event start — ") + name);
+}
+
+void MaybeLogFmodEventStart(const char* name) {
+  if (!g_probe_transitions.load(std::memory_order_relaxed) || !name || !name[0]) {
+    return;
+  }
+  static std::mutex log_mu;
+  static std::unordered_set<std::string> seen;
+  std::lock_guard<std::mutex> lock(log_mu);
+  if (seen.insert(name).second) {
+    LogWrite(std::string("fmod: event start probe — ") + name);
+  }
+}
+
+void RestoreHook(InlineHook* hook) {
+  if (!hook || !hook->active || !hook->target) {
     return;
   }
   constexpr SIZE_T kPatch = 14;
   DWORD old = 0;
-  if (VirtualProtect(g_update_hook.target, kPatch, PAGE_EXECUTE_READWRITE, &old)) {
-    std::memcpy(g_update_hook.target, g_update_hook.stolen, kPatch);
-    VirtualProtect(g_update_hook.target, kPatch, old, &old);
-    FlushInstructionCache(GetCurrentProcess(), g_update_hook.target, kPatch);
+  if (VirtualProtect(hook->target, kPatch, PAGE_EXECUTE_READWRITE, &old)) {
+    std::memcpy(hook->target, hook->stolen, kPatch);
+    VirtualProtect(hook->target, kPatch, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), hook->target, kPatch);
   }
-  g_update_hook.active = false;
+  hook->active = false;
+}
+
+void RestoreUpdatePrologue() { RestoreHook(&g_update_hook); }
+
+bool InstallPermanentHook(InlineHook* hook, void* target, void* detour, void** real_out) {
+  constexpr SIZE_T kPatch = 14;
+  if (!hook || !target || !detour || !IsExecutable(target)) {
+    return false;
+  }
+  if (hook->active && hook->target == target) {
+    return true;
+  }
+  const auto* bytes = static_cast<const uint8_t*>(target);
+  if (bytes[0] == 0xE9 || bytes[0] == 0xCC || bytes[0] == 0xC3) {
+    return false;
+  }
+
+  hook->target = target;
+  std::memcpy(hook->stolen, target, kPatch);
+  if (real_out) {
+    *real_out = target;
+  }
+
+  DWORD old = 0;
+  if (!VirtualProtect(target, kPatch, PAGE_EXECUTE_READWRITE, &old)) {
+    return false;
+  }
+  auto* p = static_cast<uint8_t*>(target);
+  p[0] = 0x48;
+  p[1] = 0xB8;
+  const uint64_t d = reinterpret_cast<uint64_t>(detour);
+  std::memcpy(p + 2, &d, 8);
+  p[10] = 0xFF;
+  p[11] = 0xE0;
+  p[12] = 0x90;
+  p[13] = 0x90;
+  VirtualProtect(target, kPatch, old, &old);
+  FlushInstructionCache(GetCurrentProcess(), target, kPatch);
+  hook->active = true;
+  return true;
 }
 
 bool InstallOneShotUpdateHook(void* target);
+
+FmodResult __cdecl HookedEventStart(void* event, int paused, void** instance) {
+  if (!g_real_event_start) {
+    return 0;
+  }
+  const FmodResult result = g_real_event_start(event, paused, instance);
+  if (event) {
+    char name[256]{};
+    bool named = false;
+    if (g_event_get_info) {
+      named = g_event_get_info(event, nullptr, name, static_cast<int>(sizeof(name))) == 0 &&
+              name[0];
+    }
+    if (named) {
+      MaybeLogFmodEventStart(name);
+      if (LooksLikeAreaTransitionEvent(name)) {
+        NoteAreaTransitionEvent(name);
+      }
+    } else if (g_probe_transitions.load(std::memory_order_relaxed)) {
+      static std::atomic<int> unnamed{0};
+      const int n = unnamed.fetch_add(1, std::memory_order_relaxed);
+      if (n < 20) {
+        char buf[80];
+        snprintf(buf, sizeof(buf), "fmod: event start unnamed #%d event=%p", n,
+                 event);
+        LogWrite(buf);
+      }
+    }
+  }
+  return result;
+}
 
 FmodResult __cdecl HookedCppUpdate(EventSystem* self) {
   const bool first = !g_captured.load(std::memory_order_relaxed);
@@ -245,13 +396,31 @@ bool ResolveAndHook() {
     return false;
   }
 
+  g_event_get_info =
+      reinterpret_cast<FnEventGetInfo>(GetProcAddress(fmod, "FMOD_Event_GetInfo"));
+  void* event_start = reinterpret_cast<void*>(GetProcAddress(fmod, "FMOD_Event_Start"));
+  if (!event_start) {
+    event_start = reinterpret_cast<void*>(
+        GetProcAddress(fmod, "?start@Event@FMOD@@QEAA?AW4FMOD_RESULT@@XZ"));
+  }
+
   bool installed = false;
+  bool event_hooked = false;
   {
     std::lock_guard<std::mutex> lock(g_hook_mu);
     g_want_hook.store(true, std::memory_order_relaxed);
     installed = InstallOneShotUpdateHook(update);
     if (!installed) {
       g_want_hook.store(false, std::memory_order_relaxed);
+    }
+    if (event_start && g_event_get_info) {
+      void* real = nullptr;
+      event_hooked =
+          InstallPermanentHook(&g_event_start_hook, event_start, reinterpret_cast<void*>(&HookedEventStart),
+                               &real);
+      if (event_hooked) {
+        g_real_event_start = reinterpret_cast<FnEventStart>(real);
+      }
     }
   }
   if (!installed) {
@@ -261,6 +430,13 @@ bool ResolveAndHook() {
 
   g_ready.store(true, std::memory_order_relaxed);
   LogWrite("fmod: EventSystem::update hook armed (audio-thread SE capture)");
+  if (event_hooked) {
+    LogWrite("fmod: FMOD_Event_Start hook armed (area-transition SFX capture)");
+  } else if (!g_event_get_info) {
+    LogWrite("fmod: FMOD_Event_GetInfo missing (area-transition SFX hook disabled)");
+  } else {
+    LogWrite("fmod: FMOD_Event_Start export missing (area-transition SFX hook disabled)");
+  }
   return true;
 }
 
@@ -278,19 +454,42 @@ bool FmodVolumeInit() {
 
 void FmodVolumeShutdown() {
   g_want_hook.store(false, std::memory_order_relaxed);
-  bool was_hooked = false;
+  bool was_update = false;
+  bool was_event = false;
   {
     std::lock_guard<std::mutex> lock(g_hook_mu);
-    was_hooked = g_update_hook.active;
+    was_update = g_update_hook.active;
+    was_event = g_event_start_hook.active;
     RestoreUpdatePrologue();
+    RestoreHook(&g_event_start_hook);
+    g_real_event_start = nullptr;
   }
-  if (was_hooked) {
+  if (was_update) {
     LogWrite("fmod: EventSystem::update hook removed");
+  }
+  if (was_event) {
+    LogWrite("fmod: FMOD_Event_Start hook removed");
   }
   g_ready.store(false, std::memory_order_relaxed);
   g_event_system.store(nullptr, std::memory_order_relaxed);
   g_se_category.store(nullptr, std::memory_order_relaxed);
   g_se_valid.store(false, std::memory_order_relaxed);
+  g_area_transition_pending.store(false, std::memory_order_relaxed);
+}
+
+void FmodSetProbeTransitions(bool enabled) {
+  g_probe_transitions.store(enabled, std::memory_order_relaxed);
+}
+
+bool FmodConsumeAreaTransition(char* out_name, int out_name_cap) {
+  if (!g_area_transition_pending.exchange(false, std::memory_order_acq_rel)) {
+    return false;
+  }
+  if (out_name && out_name_cap > 0) {
+    std::lock_guard<std::mutex> lock(g_area_mu);
+    std::snprintf(out_name, static_cast<size_t>(out_name_cap), "%s", g_area_transition_name);
+  }
+  return true;
 }
 
 bool FmodTryGetSfxVolume(float* out_volume) {

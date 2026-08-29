@@ -5,9 +5,10 @@
 
 namespace sitcom {
 
-// MenuMan+0x104 "Message" / Display Banner type (EMEVD; same id semantics as DSR).
-constexpr std::uint8_t kBannerNone = 0;
-constexpr std::uint8_t kBannerCurrentLocation = 8;  // area title card ("Map Name")
+constexpr int kMenuManFlagsOffset = 0x32;
+constexpr int kMenuManFlagCount = 500;
+constexpr int kMenuManProbeFlagCount = 25;
+constexpr std::uint8_t kBannerCurrentLocation = 8;  // EMEVD Display Banner — area title card
 
 struct BossPair {
   std::int32_t cheer_flag;
@@ -30,8 +31,22 @@ struct GameSnapshot {
   std::vector<std::int32_t> defeat_flags_on;
 
   bool area_valid = false;
+  std::uint8_t area_number = 255;
+  bool world_block_valid = false;
+  std::int32_t world_block_id = -1;
+  bool title_fade_valid = false;
+  float title_fade_remain = 0.f;
+  float title_fade_alpha = 0.f;
+  float mapin_fade_remain = 0.f;
+  float mapin_fade_alpha = 0.f;
   bool banner_valid = false;
   std::uint8_t banner_message = 0;
+  std::int32_t banner_flag_idx = -1;
+  bool menu_man_probe_valid = false;
+  std::int32_t menu_man_flags_probe[kMenuManProbeFlagCount]{};
+  std::int32_t menu_man_i32_100 = 0;
+  std::int32_t menu_man_i32_104 = 0;
+  std::int32_t menu_man_i32_108 = 0;
 
   bool on_title_screen = false;
   std::uint8_t game_man_title = 0;
@@ -41,6 +56,10 @@ struct GameSnapshot {
   std::int32_t stay_anim_upper = -1;
   std::int32_t stay_anim_lower = -1;
   bool anim_valid = false;
+
+  // Sum of HP + ashen estus flask quantities in player inventory (-1 = unread).
+  std::int32_t estus_charges = -1;
+  bool estus_charges_valid = false;
 };
 
 class GameState {
@@ -60,6 +79,7 @@ class GameState {
   std::uintptr_t menu_man_ptr_ = 0;
   std::uintptr_t loading_ptr_ = 0;
   std::uintptr_t field_area_ptr_ = 0;
+  std::uintptr_t sprj_fade_ptr_ = 0;
 };
 
 }  // namespace sitcom

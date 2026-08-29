@@ -118,9 +118,11 @@ DWORD WINAPI WorkerMain(LPVOID) {
   std::uint64_t ticks = 0;
   float last_logged_sfx = -1.f;
   bool startup_laugh_pending = true;
+  std::uint64_t last_sfx_change_ms = 0;
   const std::uint64_t worker_start_ms = static_cast<std::uint64_t>(GetTickCount64());
   while (g_running) {
     const GameSnapshot snap = game.Read();
+    const auto now_ms = static_cast<std::uint64_t>(GetTickCount64());
 
     float sfx = 1.f;
     const bool sfx_ok = FmodTryGetSfxVolume(&sfx);
@@ -129,16 +131,25 @@ DWORD WINAPI WorkerMain(LPVOID) {
       if (std::fabs(sfx - last_logged_sfx) > 0.01f) {
         LogWrite("audio: FMOD SE volume=" + std::to_string(sfx));
         last_logged_sfx = sfx;
+        last_sfx_change_ms = now_ms;
       }
     } else {
       audio.SetGameSfxVolume(1.f);
     }
 
     if (startup_laugh_pending) {
-      const auto elapsed = static_cast<std::uint64_t>(GetTickCount64()) - worker_start_ms;
-      if (sfx_ok || elapsed >= 3000) {
-        LogWrite("worker: playing startup laugh smoke-test (deferred)");
-        audio.Play(SoundCategory::Laugh);
+      const auto elapsed = now_ms - worker_start_ms;
+      const auto sfx_stable_ms =
+          last_sfx_change_ms != 0 ? (now_ms - last_sfx_change_ms) : 0;
+      const bool sfx_settled = sfx_ok && sfx_stable_ms >= 8000;
+      const bool title_ready = snap.on_title_screen && !snap.is_loading;
+      if (title_ready && sfx_settled) {
+        LogWrite("worker: playing startup laugh smoke-test (title+sfx settled 8s, PlaySound)");
+        audio.PlayTitleSmokeTest(SoundCategory::Laugh);
+        startup_laugh_pending = false;
+      } else if (elapsed >= 20000) {
+        LogWrite("worker: playing startup laugh smoke-test (timeout)");
+        audio.PlayTitleSmokeTest(SoundCategory::Laugh);
         startup_laugh_pending = false;
       }
     }
@@ -160,13 +171,23 @@ DWORD WINAPI WorkerMain(LPVOID) {
                " hp=" + std::to_string(snap.player_hp) + "/" + std::to_string(snap.player_max_hp) +
                " boss_fight=" + std::to_string(snap.boss_fight_active) +
                " cheer=" + std::to_string(snap.boss_cheer_flag) +
-               " banner=" + std::to_string(snap.banner_message) + " sfx=" + sfx_buf +
+               " title_fade=" + std::to_string(snap.title_fade_remain) + "/" +
+               std::to_string(snap.title_fade_alpha) +
+               " mapin=" + std::to_string(snap.mapin_fade_remain) + "/" +
+               std::to_string(snap.mapin_fade_alpha) +
+               " block=" + std::to_string(snap.world_block_id) +
+               " area=" + std::to_string(snap.area_number) +
+               " banner=" + std::to_string(static_cast<unsigned>(snap.banner_message)) +
+               " banner_idx=" + std::to_string(snap.banner_flag_idx) +
+               " sfx=" + sfx_buf +
                " loading=" + std::to_string(snap.is_loading) +
+               " estus=" + std::to_string(snap.estus_charges) +
                " anim=" + std::to_string(snap.current_anim) +
                " stay=" + std::to_string(snap.stay_anim_upper) + "/" +
                std::to_string(snap.stay_anim_lower));
     }
     events.Update(snap, cfg, audio);
+    FmodSetProbeTransitions(cfg.probe_transitions);
     if (WaitForSingleObject(g_stop_event, poll_ms) != WAIT_TIMEOUT) {
       break;
     }

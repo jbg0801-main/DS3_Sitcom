@@ -6,6 +6,8 @@
 #include <windows.h>
 #include <psapi.h>
 
+#include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <string>
 #include <unordered_set>
@@ -113,6 +115,181 @@ std::uintptr_t ReadPlayerIns(std::uintptr_t world_chr_slot) {
   return ReadT<std::uintptr_t>(world_chr + 0x80);
 }
 
+bool IsEstusFlaskItemId(std::int32_t item_id) {
+  if (item_id >= 0x40000096 && item_id <= 0x400000A9) {
+    return true;
+  }
+  if (item_id >= 0x400000BE && item_id <= 0x400000D3) {
+    return true;
+  }
+  if (item_id >= 0x400007E4 && item_id <= 0x400007EE) {
+    return true;
+  }
+  return false;
+}
+
+void ReadEstusCharges(GameSnapshot& s, std::uintptr_t /*game_data_man_slot*/) {
+  // Remaining drink count is not exposed in TGA PlayerGameData; empty-flask uses anim detection.
+  s.estus_charges = -1;
+  s.estus_charges_valid = false;
+}
+
+std::uintptr_t Deref(std::uintptr_t addr) {
+  if (!IsReadable(addr)) {
+    return 0;
+  }
+  return ReadT<std::uintptr_t>(addr);
+}
+
+bool SaneFadeRemain(float v) {
+  return std::isfinite(v) && v >= -0.01f && v <= 30.f;
+}
+
+bool SaneFadeAlpha(float v) {
+  return std::isfinite(v) && v >= -0.01f && v <= 1.05f;
+}
+
+// CE pointer path: read between offsets, add on the last.
+std::uintptr_t ResolveCePointerField(std::uintptr_t slot, const std::uint32_t* offs,
+                                     std::size_t count) {
+  if (!slot || !offs || count == 0 || !IsReadable(slot)) {
+    return 0;
+  }
+  std::uintptr_t addr = ReadT<std::uintptr_t>(slot);
+  if (!addr) {
+    return 0;
+  }
+  for (std::size_t i = 0; i + 1 < count; ++i) {
+    if (!IsReadable(addr + offs[i])) {
+      return 0;
+    }
+    addr = ReadT<std::uintptr_t>(addr + offs[i]);
+    if (!addr) {
+      return 0;
+    }
+  }
+  if (!IsReadable(addr + offs[count - 1])) {
+    return 0;
+  }
+  return addr + offs[count - 1];
+}
+
+// Parent chain reads, then add embedded struct + field offset (no deref at +28).
+std::uintptr_t ResolveCePointerEmbedded(std::uintptr_t slot, const std::uint32_t* chain,
+                                      std::size_t chain_count, std::uint32_t field_off) {
+  if (!slot || !chain || chain_count == 0 || !IsReadable(slot)) {
+    return 0;
+  }
+  std::uintptr_t addr = ReadT<std::uintptr_t>(slot);
+  if (!addr) {
+    return 0;
+  }
+  for (std::size_t i = 0; i < chain_count; ++i) {
+    if (!IsReadable(addr + chain[i])) {
+      return 0;
+    }
+    addr = ReadT<std::uintptr_t>(addr + chain[i]);
+    if (!addr) {
+      return 0;
+    }
+  }
+  if (!IsReadable(addr + field_off)) {
+    return 0;
+  }
+  return addr + field_off;
+}
+
+bool ReadSprjFadeAtPanel(std::uintptr_t panel, float* title_remain, float* title_alpha,
+                         float* mapin_remain, float* mapin_alpha) {
+  if (!panel || !IsReadable(panel + 0xF8)) {
+    return false;
+  }
+  *title_remain = ReadT<float>(panel + 0x38);
+  *title_alpha = ReadT<float>(panel + 0x1C);
+  *mapin_remain = ReadT<float>(panel + 0xF8);
+  *mapin_alpha = ReadT<float>(panel + 0xDC);
+  const auto sane_or_zero = [](float v, float max_v) {
+    return v == 0.f || (std::isfinite(v) && v >= -0.01f && v <= max_v);
+  };
+  return sane_or_zero(*title_remain, 30.f) && sane_or_zero(*title_alpha, 1.05f) &&
+         sane_or_zero(*mapin_remain, 30.f) && sane_or_zero(*mapin_alpha, 1.05f);
+}
+
+bool ReadSprjFadeTitleFade(std::uintptr_t sprj_fade_slot, float* title_remain, float* title_alpha,
+                           float* mapin_remain, float* mapin_alpha) {
+  if (!title_remain || !title_alpha || !mapin_remain || !mapin_alpha || !sprj_fade_slot) {
+    return false;
+  }
+
+  *title_remain = 0.f;
+  *title_alpha = 0.f;
+  *mapin_remain = 0.f;
+  *mapin_alpha = 0.f;
+
+  auto score = [](float tr, float ta, float mr, float ma) {
+    return std::max({tr, ta, mr, ma});
+  };
+
+  float best_tr = 0.f;
+  float best_ta = 0.f;
+  float best_mr = 0.f;
+  float best_ma = 0.f;
+  float best_score = 0.f;
+
+  const auto try_panel = [&](std::uintptr_t panel) {
+    if (!panel) {
+      return;
+    }
+    float tr = 0.f;
+    float ta = 0.f;
+    float mr = 0.f;
+    float ma = 0.f;
+    if (!ReadSprjFadeAtPanel(panel, &tr, &ta, &mr, &ma)) {
+      return;
+    }
+    const float s = score(tr, ta, mr, ma);
+    if (s >= best_score) {
+      best_score = s;
+      best_tr = tr;
+      best_ta = ta;
+      best_mr = mr;
+      best_ma = ma;
+    }
+  };
+
+  const std::uint32_t chain_long[] = {8, 8, 0};
+  const std::uint32_t chain_short[] = {8, 8};
+
+  try_panel(ResolveCePointerEmbedded(sprj_fade_slot, chain_long, 3, 0x28));
+  try_panel(ResolveCePointerEmbedded(sprj_fade_slot, chain_short, 2, 0x28));
+
+  const std::uintptr_t imp = Deref(sprj_fade_slot);
+  if (imp) {
+    const std::uintptr_t fs = Deref(imp + 0x8);
+    if (fs) {
+      try_panel(fs);
+      try_panel(fs + 0x28);
+      const std::uintptr_t mid = Deref(fs + 0x8);
+      if (mid) {
+        if (const std::uintptr_t p = Deref(mid)) {
+          try_panel(p + 0x28);
+        }
+        try_panel(mid + 0x28);
+      }
+      const std::uintptr_t mid0 = Deref(fs);
+      if (mid0) {
+        try_panel(mid0 + 0x28);
+      }
+    }
+  }
+
+  *title_remain = best_tr;
+  *title_alpha = best_ta;
+  *mapin_remain = best_mr;
+  *mapin_alpha = best_ma;
+  return imp != 0;
+}
+
 }  // namespace
 
 bool GameState::ResolveBases() {
@@ -193,7 +370,7 @@ bool GameState::ResolveBases() {
     new_menu_system_ptr_ = ScanRipSlot(base, size, pat_nms2, mask_nms2, 3, 7);
   }
 
-  // MenuMan — Display Banner / "Message" at +0x104 (8 = Current Location)
+  // MenuMan — DS3 uses flags[i32] at +0x32 (not DSR byte at +0x104). Banner type 8 = Current Location.
   // Mask must be exactly 20 chars: 48 8B 0D + disp4 + 33 C0 48 39 81 + disp4 + 0F 95 C0 C3
   const std::uint8_t pat_mm[] = {0x48, 0x8B, 0x0D, 0, 0, 0, 0, 0x33, 0xC0, 0x48, 0x39, 0x81,
                                  0,    0,    0,    0, 0x0F, 0x95, 0xC0, 0xC3};
@@ -206,23 +383,46 @@ bool GameState::ResolveBases() {
   const char mask_ld[] = "xx????x????xxxxxx";
   loading_ptr_ = ScanRipSlot(base, size, pat_ld, mask_ld, 2, 7);
 
-  // FieldArea — event flags context
+  // FieldArea — event flags context + current world block (+0x20)
   const std::uint8_t pat_fa[] = {0x48, 0x8B, 0x0D, 0, 0, 0, 0, 0x48, 0x85, 0xC9, 0x74, 0x26,
                                  0x44, 0x8B};
   const char mask_fa[] = "xxx????xxxxxxx";
   field_area_ptr_ = ScanRipSlot(base, size, pat_fa, mask_fa, 3, 7);
 
-  char buf[320];
+  // SprjFade — area title card fade (TGA pointer chain; try TGA AOB then SoulSplitter)
+  {
+    const std::uint8_t pat_sf_tga[] = {0x48, 0x89, 0x7C, 0x24, 0,    0x48, 0x8B, 0xF9, 0xE8, 0,
+                                       0,    0,    0,    0,    0x84, 0xC0, 0x74, 0,    0x48, 0x8B, 0x0D};
+    const char mask_sf_tga[] = "xxxx?xxxx????xx?xxx";
+    const auto hit_tga = PatternScan(base, size, pat_sf_tga, mask_sf_tga);
+    if (hit_tga) {
+      sprj_fade_ptr_ = ResolveRip(hit_tga + 17, 3, 7);
+    }
+    if (!sprj_fade_ptr_) {
+      const std::uint8_t pat_sf[] = {0x48, 0x8B, 0x0D, 0, 0, 0, 0, 0x4C, 0x8D, 0x4C, 0x24, 0x38,
+                                     0x4C, 0x8D, 0x44, 0x24, 0x48, 0x33, 0xD2};
+      const char mask_sf[] = "xxx????xxxxxxxxxx";
+      sprj_fade_ptr_ = ScanRipSlot(base, size, pat_sf, mask_sf, 3, 7);
+      if (sprj_fade_ptr_) {
+        LogWrite("game_state: SprjFade resolved via SoulSplitter AOB");
+      }
+    } else {
+      LogWrite("game_state: SprjFade resolved via TGA AOB");
+    }
+  }
+
+  char buf[384];
   snprintf(buf, sizeof(buf),
            "game_state: WorldChr*=0x%llX GameDataMan*=0x%llX GameMan*=0x%llX NewMenu*=0x%llX "
-           "MenuMan*=0x%llX Loading*=0x%llX FieldArea*=0x%llX",
+           "MenuMan*=0x%llX Loading*=0x%llX FieldArea*=0x%llX SprjFade*=0x%llX",
            static_cast<unsigned long long>(world_chr_ptr_),
            static_cast<unsigned long long>(game_data_man_ptr_),
            static_cast<unsigned long long>(game_man_ptr_),
            static_cast<unsigned long long>(new_menu_system_ptr_),
            static_cast<unsigned long long>(menu_man_ptr_),
            static_cast<unsigned long long>(loading_ptr_),
-           static_cast<unsigned long long>(field_area_ptr_));
+           static_cast<unsigned long long>(field_area_ptr_),
+           static_cast<unsigned long long>(sprj_fade_ptr_));
   LogWrite(buf);
 
   if (!world_chr_ptr_ || !game_data_man_ptr_) {
@@ -233,7 +433,10 @@ bool GameState::ResolveBases() {
     LogWrite("game_state: GameMan AOB not found (using MenuMan / menu-state title fallback)");
   }
   if (!menu_man_ptr_) {
-    LogWrite("game_state: MenuMan pattern not found (area title wipe disabled)");
+    LogWrite("game_state: MenuMan pattern not found (MenuMan probes disabled)");
+  }
+  if (!sprj_fade_ptr_) {
+    LogWrite("game_state: SprjFade pattern not found (area title wipe uses load/world-block fallbacks)");
   }
   return true;
 }
@@ -312,6 +515,7 @@ GameSnapshot GameState::Read() {
     if (game_data) {
       s.deaths = ReadT<std::int32_t>(game_data + 0x98);
     }
+    ReadEstusCharges(s, game_data_man_ptr_);
   }
 
   if (new_menu_system_ptr_ && IsReadable(new_menu_system_ptr_)) {
@@ -349,14 +553,95 @@ GameSnapshot GameState::Read() {
 
   s.on_title_screen = on_title;
 
-  if (menu_man && IsReadable(menu_man + 0x104)) {
-    s.banner_message = ReadT<std::uint8_t>(menu_man + 0x104);
-    s.banner_valid = true;
+  if (menu_man) {
+    s.menu_man_probe_valid = true;
+    for (int i = 0; i < kMenuManProbeFlagCount; ++i) {
+      const auto off = static_cast<std::uintptr_t>(kMenuManFlagsOffset + i * 4);
+      if (IsReadable(menu_man + off)) {
+        s.menu_man_flags_probe[i] = ReadT<std::int32_t>(menu_man + off, 0);
+      }
+    }
+    if (IsReadable(menu_man + 0x100)) {
+      s.menu_man_i32_100 = ReadT<std::int32_t>(menu_man + 0x100, 0);
+    }
+    if (IsReadable(menu_man + 0x104)) {
+      s.menu_man_i32_104 = ReadT<std::int32_t>(menu_man + 0x104, 0);
+    }
+    if (IsReadable(menu_man + 0x108)) {
+      s.menu_man_i32_108 = ReadT<std::int32_t>(menu_man + 0x108, 0);
+    }
+
+    s.banner_flag_idx = -1;
+    s.banner_message = 0;
+    for (int i = 0; i < kMenuManFlagCount; ++i) {
+      const auto off = static_cast<std::uintptr_t>(kMenuManFlagsOffset + i * 4);
+      if (!IsReadable(menu_man + off)) {
+        continue;
+      }
+      const auto flag = ReadT<std::int32_t>(menu_man + off, 0);
+      if (flag == static_cast<std::int32_t>(kBannerCurrentLocation)) {
+        s.banner_message = kBannerCurrentLocation;
+        s.banner_flag_idx = i;
+        s.banner_valid = true;
+        break;
+      }
+    }
+    if (!s.banner_valid && IsReadable(menu_man + 0x104)) {
+      const auto legacy = ReadT<std::uint8_t>(menu_man + 0x104);
+      if (legacy == kBannerCurrentLocation) {
+        s.banner_message = legacy;
+        s.banner_valid = true;
+      }
+    }
+  }
+
+  if (sprj_fade_ptr_) {
+    float title_remain = 0.f;
+    float title_alpha = 0.f;
+    float mapin_remain = 0.f;
+    float mapin_alpha = 0.f;
+    if (ReadSprjFadeTitleFade(sprj_fade_ptr_, &title_remain, &title_alpha, &mapin_remain,
+                              &mapin_alpha)) {
+      s.title_fade_remain = title_remain;
+      s.title_fade_alpha = title_alpha;
+      s.mapin_fade_remain = mapin_remain;
+      s.mapin_fade_alpha = mapin_alpha;
+      s.title_fade_valid = true;
+      static bool logged = false;
+      if (!logged) {
+        logged = true;
+        LogWrite("game_state: SprjFade panel readable (area title fade tracking live)");
+      }
+      if (title_remain > 0.05f || mapin_remain > 0.05f) {
+        static float last_log_score = 0.f;
+        const float score = std::max(title_remain, mapin_remain);
+        if (score - last_log_score > 0.25f) {
+          last_log_score = score;
+          LogWrite("game_state: SprjFade live title=" + std::to_string(title_remain) + "/" +
+                   std::to_string(title_alpha) + " mapin=" + std::to_string(mapin_remain) + "/" +
+                   std::to_string(mapin_alpha));
+        }
+      }
+    }
   }
 
   if (field_area_ptr_ && IsReadable(field_area_ptr_)) {
     const auto field_area = ReadT<std::uintptr_t>(field_area_ptr_);
-    s.area_valid = field_area != 0;
+    if (field_area && IsReadable(field_area + 0x20)) {
+      s.world_block_id = ReadT<std::int32_t>(field_area + 0x20);
+      s.world_block_valid = true;
+    }
+    if (field_area && IsReadable(field_area + 0x10)) {
+      const auto world_info = ReadT<std::uintptr_t>(field_area + 0x10);
+      if (world_info && IsReadable(world_info + 0x10)) {
+        const int len = ReadT<std::int32_t>(world_info + 0x8, 0);
+        const auto list = ReadT<std::uintptr_t>(world_info + 0x10);
+        if (len > 0 && list && IsReadable(list + 0xB)) {
+          s.area_number = ReadT<std::uint8_t>(list + 0xB);
+          s.area_valid = true;
+        }
+      }
+    }
   }
 
   s.in_gameplay = s.player_valid && !s.is_loading && !s.on_title_screen;

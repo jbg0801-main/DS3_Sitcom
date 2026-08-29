@@ -22,6 +22,8 @@ struct Config {
   bool laugh_on_no_spell = true;
   bool laugh_on_ladder_fall = true;
 
+  bool probe_transitions = true;
+
   float laugh_hit_seconds = 1.5f;
   float ooh_cooldown_seconds = 0.75f;
 

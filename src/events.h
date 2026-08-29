@@ -15,7 +15,9 @@ class EventDetector {
 
  private:
   bool has_prev_ = false;
+  bool has_prev2_ = false;
   GameSnapshot prev_{};
+  GameSnapshot prev2_{};
   std::uint64_t last_laugh_hit_ms_ = 0;
   std::uint64_t last_ooh_ms_ = 0;
   std::uint64_t last_fail_laugh_ms_ = 0;
@@ -24,7 +26,14 @@ class EventDetector {
   bool flags_seeded_ = false;
   std::uint64_t gameplay_seeded_ms_ = 0;
   std::uint64_t pending_hit_laugh_ms_ = 0;
+  std::uint64_t last_wipe_ms_ = 0;
+  std::uint64_t last_anim_probe_ms_ = 0;
+  bool loading_from_gameplay_ = false;
+  bool spawn_load_seen_ = false;
+  bool block_baseline_seen_ = false;
   static constexpr std::uint64_t kHitLaughDeferMs = 300;
+  static constexpr std::uint64_t kWipeCooldownMs = 10000;
+  static constexpr std::uint64_t kAnimProbeMinMs = 200;
 };
 
 }  // namespace sitcom

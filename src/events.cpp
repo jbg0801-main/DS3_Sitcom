@@ -1,11 +1,13 @@
 #include "events.h"
 
+#include "fmod_volume.h"
 #include "game_state.h"
 #include "item_hooks.h"
 #include "log.h"
 
 #include <windows.h>
 
+#include <cmath>
 #include <string>
 #include <unordered_set>
 
@@ -27,12 +29,98 @@ bool IsFailCastAnim(std::int32_t anim) {
   return anim == 6299 || anim == 6399;
 }
 
-bool IsEmptyEstusAnim(std::int32_t anim) {
-  return anim == 7588 || anim == 7589;
+// DS3 TAE behavior ids (anim may appear as 19001 or 10019001).
+std::int32_t AnimBehavior(std::int32_t anim) {
+  if (anim < 0) {
+    return -1;
+  }
+  return anim % 100000;
 }
 
-bool IsGoodsProbeAnim(std::int32_t anim) {
-  return anim >= 7400 && anim <= 7600;
+// ESD 017 Estus Empty — playtest: 10019001→10019002 loop. Not 50113 (2H) or 290xx (block).
+bool IsEmptyEstusStartAnim(std::int32_t anim) {
+  return AnimBehavior(anim) == 19001;
+}
+
+bool IsEstusProbeAnim(std::int32_t anim) {
+  const int b = AnimBehavior(anim);
+  return b == 19001 || b == 19002 || (b >= 50110 && b <= 50112);
+}
+
+bool IsBlockOrTwoHandAnim(std::int32_t anim) {
+  const int b = AnimBehavior(anim);
+  return b == 29040 || b == 29012 || b == 29025 || b == 50113 || b == 50114;
+}
+
+// Weapon swap / block anims that briefly pass through 19001 without an empty flask.
+bool IsWeaponBlockOrSwapAnim(std::int32_t anim) {
+  if (IsBlockOrTwoHandAnim(anim)) {
+    return true;
+  }
+  const int b = AnimBehavior(anim);
+  if (b >= 29000 && b <= 29100) {
+    return true;
+  }
+  if (b >= 27100 && b <= 27200) {
+    return true;
+  }
+  if (b == 23100 || b == 68010 || b == 68011 || b == 68012) {
+    return true;
+  }
+  return false;
+}
+
+bool PrevAnimBlocksEmptyEstus(const GameSnapshot& prev) {
+  return IsWeaponBlockOrSwapAnim(prev.current_anim) ||
+         IsWeaponBlockOrSwapAnim(prev.stay_anim_upper) ||
+         IsWeaponBlockOrSwapAnim(prev.stay_anim_lower);
+}
+
+bool IsEstusEmptyContext(const GameSnapshot& snap, const GameSnapshot& prev,
+                         const GameSnapshot* prev2) {
+  if (AnimBehavior(snap.current_anim) != 19001) {
+    return false;
+  }
+  if (PrevAnimBlocksEmptyEstus(prev)) {
+    return false;
+  }
+  const int pb = AnimBehavior(prev.current_anim);
+  if (prev2 && prev2->anim_valid) {
+    const int ppb = AnimBehavior(prev2->current_anim);
+    if ((pb == 20210 || pb == 20110 || pb == 20010) &&
+        (ppb >= 27100 && ppb <= 27200 || ppb >= 29000 && ppb <= 29100)) {
+      return false;
+    }
+  }
+  if (pb == 0 || pb == 19000 || pb == 19100 || pb == 19002 || pb == 20210 || pb == 20110 ||
+      pb == 20010 || pb == 50110 || pb == 50111 || pb == 50112) {
+    return true;
+  }
+  return false;
+}
+
+void LogMenuManProbe(const char* tag, const GameSnapshot& snap) {
+  if (!snap.menu_man_probe_valid) {
+    return;
+  }
+  std::string msg = std::string("probe: ") + tag + " area=" + std::to_string(snap.area_number) +
+                    " block=" + std::to_string(snap.world_block_id) +
+                    " banner_idx=" + std::to_string(snap.banner_flag_idx) + " flags[0..24]=";
+  for (int i = 0; i < kMenuManProbeFlagCount; ++i) {
+    if (i > 0) {
+      msg += ',';
+    }
+    msg += std::to_string(snap.menu_man_flags_probe[i]);
+  }
+  msg += " i32@100=" + std::to_string(snap.menu_man_i32_100) +
+         " i32@104=" + std::to_string(snap.menu_man_i32_104) +
+         " i32@108=" + std::to_string(snap.menu_man_i32_108);
+  LogWrite(msg);
+}
+
+bool AnimChanged(const GameSnapshot& snap, const GameSnapshot& prev) {
+  return snap.current_anim != prev.current_anim || snap.stay_anim_upper != prev.stay_anim_upper ||
+         snap.stay_anim_lower != prev.stay_anim_lower;
 }
 
 bool AnimEntered(const GameSnapshot& snap, const GameSnapshot& prev, bool (*pred)(std::int32_t)) {
@@ -64,11 +152,18 @@ bool TryFailLaugh(std::uint64_t now, std::uint64_t* last_ms, float cooldown_sec,
 
 void EventDetector::Reset() {
   has_prev_ = false;
+  has_prev2_ = false;
   prev_ = {};
+  prev2_ = {};
   last_laugh_hit_ms_ = 0;
   last_ooh_ms_ = 0;
   last_fail_laugh_ms_ = 0;
   pending_hit_laugh_ms_ = 0;
+  last_wipe_ms_ = 0;
+  last_anim_probe_ms_ = 0;
+  loading_from_gameplay_ = false;
+  spawn_load_seen_ = false;
+  block_baseline_seen_ = false;
   applause_armed_ = false;
   armed_defeat_flag_ = 0;
   flags_seeded_ = false;
@@ -122,6 +217,13 @@ void EventDetector::Update(const GameSnapshot& snap, const Config& cfg, Audio& a
     return;
   }
 
+  const auto advance_history = [&]() {
+    prev2_ = prev_;
+    has_prev2_ = has_prev_;
+    prev_ = snap;
+    has_prev_ = true;
+  };
+
   if (cfg.ooh_on_item_get && snap.in_gameplay && !snap.on_title_screen) {
     const bool from_anim = AnimEntered(snap, prev_, IsPickupAnim);
     if (from_anim || ooh_from_itemget) {
@@ -138,13 +240,151 @@ void EventDetector::Update(const GameSnapshot& snap, const Config& cfg, Audio& a
     }
   }
 
-  // Area title card: MenuMan banner → 8 (Current Location).
-  if (cfg.wipe_on_area_title && snap.banner_valid && prev_.banner_valid && snap.area_valid &&
-      snap.in_gameplay && !snap.is_loading) {
-    if (snap.banner_message == kBannerCurrentLocation &&
-        prev_.banner_message != kBannerCurrentLocation) {
-      LogWrite("event: area title card (banner=Current_Location)");
+  const bool wipe_ready = cfg.wipe_on_area_title && flags_seeded_ && spawn_load_seen_ &&
+                          snap.in_gameplay && !snap.is_loading &&
+                          now - last_wipe_ms_ >= kWipeCooldownMs;
+
+  // Area title popup — MenuMan banner fields (DS3 may use i32@104, not DSR byte-only).
+  if (wipe_ready && snap.menu_man_probe_valid && prev_.menu_man_probe_valid &&
+      snap.menu_man_i32_104 == static_cast<std::int32_t>(kBannerCurrentLocation) &&
+      prev_.menu_man_i32_104 != static_cast<std::int32_t>(kBannerCurrentLocation)) {
+    LogWrite("event: area title card (MenuMan i32@104=" +
+             std::to_string(snap.menu_man_i32_104) + ")");
+    audio.Play(SoundCategory::SceneWipe);
+    last_wipe_ms_ = now;
+  }
+
+  // Area title popup — MenuMan flags[] value 8 (Current Location).
+  if (wipe_ready && snap.banner_valid && prev_.banner_valid &&
+      snap.banner_message == kBannerCurrentLocation &&
+      prev_.banner_message != kBannerCurrentLocation) {
+    LogWrite("event: area title card (MenuMan banner=" +
+             std::to_string(static_cast<unsigned>(snap.banner_message)) +
+             (snap.banner_flag_idx >= 0 ? " idx=" + std::to_string(snap.banner_flag_idx) : "") +
+             ")");
+    audio.Play(SoundCategory::SceneWipe);
+    last_wipe_ms_ = now;
+  }
+
+  // Area title popup — SprjFade Title / MapIn (fires at map trigger volumes, not on a load timer).
+  if (wipe_ready && snap.title_fade_valid && prev_.title_fade_valid) {
+    const auto fade_started = [](float cur_remain, float prev_remain, float cur_alpha,
+                                 float prev_alpha) {
+      return (cur_remain > 0.05f && prev_remain <= 0.05f) ||
+             (cur_alpha >= 0.05f && prev_alpha < 0.05f);
+    };
+    const bool title_started =
+        fade_started(snap.title_fade_remain, prev_.title_fade_remain, snap.title_fade_alpha,
+                     prev_.title_fade_alpha) ||
+        fade_started(snap.mapin_fade_remain, prev_.mapin_fade_remain, snap.mapin_fade_alpha,
+                     prev_.mapin_fade_alpha);
+    if (title_started) {
+      LogWrite("event: area title card (SprjFade title=" +
+               std::to_string(snap.title_fade_remain) + "/" + std::to_string(snap.title_fade_alpha) +
+               " mapin=" + std::to_string(snap.mapin_fade_remain) + "/" +
+               std::to_string(snap.mapin_fade_alpha) + ")");
       audio.Play(SoundCategory::SceneWipe);
+      last_wipe_ms_ = now;
+    }
+  }
+
+  // Area transition sting — same moment as the vanilla location SFX (FMOD_Event_Start hook).
+  if (wipe_ready) {
+    char fmod_name[128]{};
+    if (FmodConsumeAreaTransition(fmod_name, static_cast<int>(sizeof(fmod_name)))) {
+      LogWrite(std::string("event: area title card (FMOD ") + fmod_name + ")");
+      audio.Play(SoundCategory::SceneWipe);
+      last_wipe_ms_ = now;
+    }
+  }
+
+  // Seamless walk only: block id changes while already in-world (Fog gate / door boundaries).
+  // Bonfire warps change block at load-end; the title card comes later at a map trigger — SprjFade/FMOD.
+  if (wipe_ready && snap.world_block_valid && prev_.world_block_valid && !prev_.is_loading &&
+      snap.world_block_id != prev_.world_block_id && prev_.world_block_id >= 0 &&
+      snap.world_block_id >= 0 && block_baseline_seen_) {
+    LogWrite("event: area title card (world_block walk " + std::to_string(prev_.world_block_id) +
+             "→" + std::to_string(snap.world_block_id) + ")");
+    audio.Play(SoundCategory::SceneWipe);
+    last_wipe_ms_ = now;
+  }
+
+  // Adopt block baseline after load without wiping (title card is trigger-based, not load-timed).
+  if (snap.in_gameplay && snap.world_block_valid && snap.world_block_id >= 0) {
+    if (prev_.is_loading && !snap.is_loading) {
+      block_baseline_seen_ = true;
+    } else if (!block_baseline_seen_) {
+      block_baseline_seen_ = true;
+    }
+  }
+
+  // Track spawn load (no wipe on load end).
+  if (prev_.in_gameplay && !prev_.is_loading && snap.is_loading) {
+    loading_from_gameplay_ = true;
+  }
+  if (loading_from_gameplay_ && prev_.is_loading && !snap.is_loading && !snap.in_gameplay) {
+    loading_from_gameplay_ = false;
+  }
+  if (loading_from_gameplay_ && prev_.is_loading && !snap.is_loading && snap.in_gameplay) {
+    loading_from_gameplay_ = false;
+    if (!spawn_load_seen_) {
+      spawn_load_seen_ = true;
+    }
+  } else if (prev_.is_loading && !snap.is_loading && snap.in_gameplay && !spawn_load_seen_) {
+    spawn_load_seen_ = true;
+  }
+
+  // Legacy area id — seamless walk only (same rule as world_block; not on load-end).
+  if (wipe_ready && snap.area_valid && prev_.area_valid && !prev_.is_loading &&
+      snap.area_number != prev_.area_number && prev_.area_number != 255 &&
+      snap.area_number != 255) {
+    LogWrite("event: area title card (area walk " + std::to_string(prev_.area_number) + "→" +
+             std::to_string(snap.area_number) + ")");
+    audio.Play(SoundCategory::SceneWipe);
+    last_wipe_ms_ = now;
+  }
+
+  if (cfg.log && cfg.probe_transitions && snap.menu_man_probe_valid) {
+    if (!prev_.is_loading && snap.is_loading) {
+      LogMenuManProbe("loading-start", snap);
+    }
+    if (prev_.is_loading && !snap.is_loading) {
+      LogMenuManProbe("loading-end", snap);
+    }
+    if (snap.world_block_valid && prev_.world_block_valid &&
+        snap.world_block_id != prev_.world_block_id) {
+      LogMenuManProbe("world-block-change", snap);
+    }
+    if (snap.menu_man_i32_104 != prev_.menu_man_i32_104) {
+      LogWrite("probe: menu-i32@104 " + std::to_string(prev_.menu_man_i32_104) + "→" +
+               std::to_string(snap.menu_man_i32_104));
+    }
+    if (snap.title_fade_valid && prev_.title_fade_valid &&
+        (std::fabs(snap.title_fade_remain - prev_.title_fade_remain) > 0.05f ||
+         std::fabs(snap.title_fade_alpha - prev_.title_fade_alpha) > 0.05f ||
+         std::fabs(snap.mapin_fade_remain - prev_.mapin_fade_remain) > 0.05f ||
+         std::fabs(snap.mapin_fade_alpha - prev_.mapin_fade_alpha) > 0.05f)) {
+      LogWrite("probe: title-fade title=" + std::to_string(prev_.title_fade_remain) + "→" +
+               std::to_string(snap.title_fade_remain) + "/" +
+               std::to_string(prev_.title_fade_alpha) + "→" +
+               std::to_string(snap.title_fade_alpha) + " mapin=" +
+               std::to_string(prev_.mapin_fade_remain) + "→" +
+               std::to_string(snap.mapin_fade_remain) + "/" +
+               std::to_string(prev_.mapin_fade_alpha) + "→" +
+               std::to_string(snap.mapin_fade_alpha));
+    }
+    if (cfg.probe_transitions && wipe_ready &&
+        snap.title_fade_valid &&
+        (snap.title_fade_remain > 0.05f || snap.mapin_fade_remain > 0.05f ||
+         snap.title_fade_alpha > 0.05f || snap.mapin_fade_alpha > 0.05f)) {
+      static std::uint64_t last_live_ms = 0;
+      if (now - last_live_ms >= 500) {
+        last_live_ms = now;
+        LogWrite("probe: title-fade live title=" + std::to_string(snap.title_fade_remain) + "/" +
+                 std::to_string(snap.title_fade_alpha) + " mapin=" +
+                 std::to_string(snap.mapin_fade_remain) + "/" +
+                 std::to_string(snap.mapin_fade_alpha));
+      }
     }
   }
 
@@ -156,14 +396,14 @@ void EventDetector::Update(const GameSnapshot& snap, const Config& cfg, Audio& a
       armed_defeat_flag_ = 0;
       pending_hit_laugh_ms_ = 0;
     }
-    prev_ = snap;
+    advance_history();
     return;
   }
 
   if (!flags_seeded_) {
     flags_seeded_ = true;
     gameplay_seeded_ms_ = now;
-    prev_ = snap;
+    advance_history();
     LogWrite("event: seeded flag baselines in gameplay");
     return;
   }
@@ -219,21 +459,27 @@ void EventDetector::Update(const GameSnapshot& snap, const Config& cfg, Audio& a
   }
 
   if (snap.anim_valid && prev_.anim_valid) {
-    if (cfg.laugh_on_empty_flask &&
-        (IsGoodsProbeAnim(snap.current_anim) || IsGoodsProbeAnim(snap.stay_anim_upper) ||
-         IsGoodsProbeAnim(snap.stay_anim_lower)) &&
-        (snap.current_anim != prev_.current_anim || snap.stay_anim_upper != prev_.stay_anim_upper ||
-         snap.stay_anim_lower != prev_.stay_anim_lower)) {
-      LogWrite("probe: goods-anim cur=" + std::to_string(prev_.current_anim) + "→" +
+    if (cfg.laugh_on_empty_flask && AnimChanged(snap, prev_) &&
+        (IsEstusProbeAnim(snap.current_anim) || IsEstusProbeAnim(snap.stay_anim_upper) ||
+         IsEstusProbeAnim(snap.stay_anim_lower)) &&
+        now - last_anim_probe_ms_ >= kAnimProbeMinMs) {
+      LogWrite("probe: estus-anim cur=" + std::to_string(prev_.current_anim) + "→" +
                std::to_string(snap.current_anim) + " stay=" + std::to_string(prev_.stay_anim_upper) +
                "/" + std::to_string(prev_.stay_anim_lower) + "→" +
                std::to_string(snap.stay_anim_upper) + "/" + std::to_string(snap.stay_anim_lower));
+      last_anim_probe_ms_ = now;
+    } else if (cfg.log && AnimChanged(snap, prev_) && now - last_anim_probe_ms_ >= kAnimProbeMinMs) {
+      LogWrite("probe: anim-change cur=" + std::to_string(prev_.current_anim) + "→" +
+               std::to_string(snap.current_anim) + " stay=" + std::to_string(prev_.stay_anim_upper) +
+               "/" + std::to_string(prev_.stay_anim_lower) + "→" +
+               std::to_string(snap.stay_anim_upper) + "/" + std::to_string(snap.stay_anim_lower));
+      last_anim_probe_ms_ = now;
     }
 
-    if (cfg.laugh_on_empty_flask && AnyAnimEntered(snap, prev_, IsEmptyEstusAnim)) {
-      const std::string label = "empty flask (anim/stay=" + std::to_string(snap.current_anim) + "/" +
-                                std::to_string(snap.stay_anim_upper) + "/" +
-                                std::to_string(snap.stay_anim_lower) + ")";
+    if (cfg.laugh_on_empty_flask && AnimEntered(snap, prev_, IsEmptyEstusStartAnim) &&
+        IsEstusEmptyContext(snap, prev_, has_prev2_ ? &prev2_ : nullptr)) {
+      const std::string label = "empty flask (anim=" + std::to_string(snap.current_anim) +
+                                " estus=" + std::to_string(snap.estus_charges) + ")";
       TryFailLaugh(now, &last_fail_laugh_ms_, cfg.laugh_hit_seconds, audio, label.c_str());
     }
     if (cfg.laugh_on_locked_door && AnimEntered(snap, prev_, [](std::int32_t a) {
@@ -252,7 +498,7 @@ void EventDetector::Update(const GameSnapshot& snap, const Config& cfg, Audio& a
     }
   }
 
-  prev_ = snap;
+  advance_history();
 }
 
 }  // namespace sitcom
