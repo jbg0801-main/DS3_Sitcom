@@ -2,6 +2,8 @@
 #include "config.h"
 #include "credit.h"
 #include "dinput8_proxy.h"
+#include "estus_hooks.h"
+#include "area_title_hooks.h"
 #include "events.h"
 #include "fmod_volume.h"
 #include "game_state.h"
@@ -73,10 +75,8 @@ DWORD WINAPI WorkerMain(LPVOID) {
 
   Audio audio;
   const std::wstring sounds = JoinPath(sitcom_dir, Utf8ToWide(cfg.sounds_dir));
-  LogWrite(std::string("worker: sounds_dir exists=") + (FileExists(JoinPath(sounds, L"laugh.wav")) ||
-                                                                FileExists(JoinPath(sounds, L"laugh_01.wav"))
-                                                            ? "yes"
-                                                            : "check"));
+  LogWrite(std::string("worker: sounds_dir exists=") +
+           (FileExists(JoinPath(sounds, L"laugh.wav")) ? "yes" : "check"));
   if (!audio.Init(sounds, cfg.volume)) {
     LogWrite("worker: audio init failed");
     return 0;
@@ -100,6 +100,8 @@ DWORD WINAPI WorkerMain(LPVOID) {
   CreditEnsureHook();
 
   ItemHooksInit();
+  EstusHooksInit();
+  AreaTitleHooksInit();
 
   // Attach FMOD only after the game is up — IAT/inline hooks, no LoadLibrary, no probes.
   if (FmodVolumeInit()) {
@@ -184,7 +186,8 @@ DWORD WINAPI WorkerMain(LPVOID) {
                " estus=" + std::to_string(snap.estus_charges) +
                " anim=" + std::to_string(snap.current_anim) +
                " stay=" + std::to_string(snap.stay_anim_upper) + "/" +
-               std::to_string(snap.stay_anim_lower));
+               std::to_string(snap.stay_anim_lower) +
+               " aname=" + (snap.anim_name_valid ? snap.anim_name : "-"));
     }
     events.Update(snap, cfg, audio);
     FmodSetProbeTransitions(cfg.probe_transitions);
@@ -195,6 +198,8 @@ DWORD WINAPI WorkerMain(LPVOID) {
 
   CreditShutdown();
   ItemHooksShutdown();
+  EstusHooksShutdown();
+  AreaTitleHooksShutdown();
   game.Shutdown();
   audio.Shutdown();
   FmodVolumeShutdown();

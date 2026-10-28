@@ -32,15 +32,15 @@ If another mod already ships `dinput8.dll`, list it in `sitcom/chainload.txt` or
 
 Preferred format: **WAV, PCM signed 16-bit, 44100 Hz** (48000 OK). Stereo is fine.
 
-The loader picks randomly among `name.wav` and `name_XX.wav` / `name-XX.wav` for each category when multiple files are present.
+The loader picks randomly among `name.wav` and `name_XX.wav` / `name-XX.wav` when more than one file is present. Shipped clips are full length. `ooh` is the category with a second take (`ooh_1.wav`).
 
 | Prefix / name | Event |
 | --- | --- |
-| `laugh.wav` / `laugh_XX.wav` | Hit / death / fail laughs |
-| `cheer.wav` / `cheer_XX.wav` | Boss fight start |
-| `applause.wav` / `applause_XX.wav` | Boss defeated |
-| `ooh.wav` / `ooh_XX.wav` | Item pickup |
-| `scene_wipe.wav` / `scene_wipe_XX.wav` | Area title / map change |
+| `laugh.wav` | Hit / death / fail laughs |
+| `cheer.wav` | Boss fight start |
+| `applause.wav` | Boss defeated |
+| `ooh.wav` / `ooh_1.wav` | Item pickup |
+| `scene_wipe.wav` | Area title / map change |
 
 ## Build (Linux → Windows DLL)
 

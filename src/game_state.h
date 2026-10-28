@@ -57,6 +57,10 @@ struct GameSnapshot {
   std::int32_t stay_anim_lower = -1;
   bool anim_valid = false;
 
+  // SoulsGym PlayerAnimation string (WorldChrMan→+0x80→+0x1F90→+0x28→+0x898).
+  char anim_name[48]{};
+  bool anim_name_valid = false;
+
   // Sum of HP + ashen estus flask quantities in player inventory (-1 = unread).
   std::int32_t estus_charges = -1;
   bool estus_charges_valid = false;

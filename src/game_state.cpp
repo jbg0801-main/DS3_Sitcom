@@ -199,22 +199,9 @@ std::uintptr_t ResolveCePointerEmbedded(std::uintptr_t slot, const std::uint32_t
   return addr + field_off;
 }
 
-bool ReadSprjFadeAtPanel(std::uintptr_t panel, float* title_remain, float* title_alpha,
-                         float* mapin_remain, float* mapin_alpha) {
-  if (!panel || !IsReadable(panel + 0xF8)) {
-    return false;
-  }
-  *title_remain = ReadT<float>(panel + 0x38);
-  *title_alpha = ReadT<float>(panel + 0x1C);
-  *mapin_remain = ReadT<float>(panel + 0xF8);
-  *mapin_alpha = ReadT<float>(panel + 0xDC);
-  const auto sane_or_zero = [](float v, float max_v) {
-    return v == 0.f || (std::isfinite(v) && v >= -0.01f && v <= max_v);
-  };
-  return sane_or_zero(*title_remain, 30.f) && sane_or_zero(*title_alpha, 1.05f) &&
-         sane_or_zero(*mapin_remain, 30.f) && sane_or_zero(*mapin_alpha, 1.05f);
-}
-
+// TGA CT v3.4 FADE → Title RemainTiem offsets (CE last→first): 38, 28, 0, 8, 8.
+// +0x28 is an embedded panel (no deref); fields: RemainTiem +0x38, CurrentColor.A +0x1C.
+// MapIn RemainTiem shares the panel at +0xF8.
 bool ReadSprjFadeTitleFade(std::uintptr_t sprj_fade_slot, float* title_remain, float* title_alpha,
                            float* mapin_remain, float* mapin_alpha) {
   if (!title_remain || !title_alpha || !mapin_remain || !mapin_alpha || !sprj_fade_slot) {
@@ -226,68 +213,39 @@ bool ReadSprjFadeTitleFade(std::uintptr_t sprj_fade_slot, float* title_remain, f
   *mapin_remain = 0.f;
   *mapin_alpha = 0.f;
 
-  auto score = [](float tr, float ta, float mr, float ma) {
-    return std::max({tr, ta, mr, ma});
+  const auto try_panel = [&](std::uintptr_t panel) -> bool {
+    if (!panel || !IsReadable(panel + 0xF8)) {
+      return false;
+    }
+    const float tr = ReadT<float>(panel + 0x38);
+    const float ta = ReadT<float>(panel + 0x1C);
+    const float mr = ReadT<float>(panel + 0xF8);
+    const float ma = ReadT<float>(panel + 0xDC);
+    const auto sane_or_zero = [](float v, float max_v) {
+      return v == 0.f || (std::isfinite(v) && v >= -0.01f && v <= max_v);
+    };
+    if (!sane_or_zero(tr, 30.f) || !sane_or_zero(ta, 1.05f) || !sane_or_zero(mr, 30.f) ||
+        !sane_or_zero(ma, 1.05f)) {
+      return false;
+    }
+    *title_remain = tr;
+    *title_alpha = ta;
+    *mapin_remain = mr;
+    *mapin_alpha = ma;
+    return true;
   };
 
-  float best_tr = 0.f;
-  float best_ta = 0.f;
-  float best_mr = 0.f;
-  float best_ma = 0.f;
-  float best_score = 0.f;
-
-  const auto try_panel = [&](std::uintptr_t panel) {
-    if (!panel) {
-      return;
-    }
-    float tr = 0.f;
-    float ta = 0.f;
-    float mr = 0.f;
-    float ma = 0.f;
-    if (!ReadSprjFadeAtPanel(panel, &tr, &ta, &mr, &ma)) {
-      return;
-    }
-    const float s = score(tr, ta, mr, ma);
-    if (s >= best_score) {
-      best_score = s;
-      best_tr = tr;
-      best_ta = ta;
-      best_mr = mr;
-      best_ma = ma;
-    }
-  };
-
-  const std::uint32_t chain_long[] = {8, 8, 0};
-  const std::uint32_t chain_short[] = {8, 8};
-
-  try_panel(ResolveCePointerEmbedded(sprj_fade_slot, chain_long, 3, 0x28));
-  try_panel(ResolveCePointerEmbedded(sprj_fade_slot, chain_short, 2, 0x28));
-
-  const std::uintptr_t imp = Deref(sprj_fade_slot);
-  if (imp) {
-    const std::uintptr_t fs = Deref(imp + 0x8);
-    if (fs) {
-      try_panel(fs);
-      try_panel(fs + 0x28);
-      const std::uintptr_t mid = Deref(fs + 0x8);
-      if (mid) {
-        if (const std::uintptr_t p = Deref(mid)) {
-          try_panel(p + 0x28);
-        }
-        try_panel(mid + 0x28);
-      }
-      const std::uintptr_t mid0 = Deref(fs);
-      if (mid0) {
-        try_panel(mid0 + 0x28);
-      }
-    }
+  // Primary: TGA chain [[[SprjFade]+8]+8]+0 + 0x28.
+  const std::uint32_t chain_long[] = {0x8, 0x8, 0x0};
+  if (try_panel(ResolveCePointerEmbedded(sprj_fade_slot, chain_long, 3, 0x28))) {
+    return true;
   }
-
-  *title_remain = best_tr;
-  *title_alpha = best_ta;
-  *mapin_remain = best_mr;
-  *mapin_alpha = best_ma;
-  return imp != 0;
+  // Fallback without the +0 deref.
+  const std::uint32_t chain_short[] = {0x8, 0x8};
+  if (try_panel(ResolveCePointerEmbedded(sprj_fade_slot, chain_short, 2, 0x28))) {
+    return true;
+  }
+  return false;
 }
 
 }  // namespace
@@ -505,6 +463,35 @@ GameSnapshot GameState::Read() {
               s.anim_valid = true;
             }
           }
+        }
+      }
+    }
+
+    // SoulsGym PlayerAnimation: WorldChrMan→player→+0x1F90→+0x28→+0x898.
+    // Buffer is UTF-16LE (~40 code units); convert to ASCII for matching.
+    const auto name_mods = ReadT<std::uintptr_t>(player_ins + 0x1F90);
+    if (name_mods && IsReadable(name_mods + 0x28)) {
+      const auto name_mid = ReadT<std::uintptr_t>(name_mods + 0x28);
+      constexpr std::size_t kMaxUnits = 40;
+      if (name_mid && IsReadable(name_mid + 0x898 + kMaxUnits * 2)) {
+        const auto* src = reinterpret_cast<const char16_t*>(name_mid + 0x898);
+        char buf[sizeof(s.anim_name)]{};
+        std::size_t o = 0;
+        for (std::size_t i = 0; i < kMaxUnits && o + 1 < sizeof(buf); ++i) {
+          const char16_t u = src[i];
+          if (u == 0) {
+            break;
+          }
+          if (u < 0x20 || u > 0x7E) {
+            buf[0] = '\0';
+            o = 0;
+            break;
+          }
+          buf[o++] = static_cast<char>(u);
+        }
+        if (o > 0) {
+          std::memcpy(s.anim_name, buf, sizeof(s.anim_name));
+          s.anim_name_valid = true;
         }
       }
     }

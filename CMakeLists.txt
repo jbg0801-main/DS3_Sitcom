@@ -15,6 +15,8 @@ add_library(dinput8 SHARED
   src/credit.cpp
   src/fmod_volume.cpp
   src/item_hooks.cpp
+  src/estus_hooks.cpp
+  src/area_title_hooks.cpp
   src/event_flags.cpp
   src/game_state.cpp
   src/events.cpp

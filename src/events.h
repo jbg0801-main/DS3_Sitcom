@@ -31,6 +31,8 @@ class EventDetector {
   bool loading_from_gameplay_ = false;
   bool spawn_load_seen_ = false;
   bool block_baseline_seen_ = false;
+  std::int32_t last_seen_block_ = -1;
+  std::int32_t last_seen_area_ = 255;
   static constexpr std::uint64_t kHitLaughDeferMs = 300;
   static constexpr std::uint64_t kWipeCooldownMs = 10000;
   static constexpr std::uint64_t kAnimProbeMinMs = 200;
