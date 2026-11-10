@@ -64,10 +64,10 @@ void ItemGrantNotify(void* /*man*/, void* buffer, int* /*unknown*/) {
     g_last_item_id.store(id, std::memory_order_relaxed);
     g_last_category.store(id & 0xF0000000, std::memory_order_relaxed);
     if (IsEstusOrAshenRestock(id)) {
+      // Bonfire restock hits this path — do not LogWrite from the grant hook
+      // (game thread); just mark suppressed for the ooh filter.
       g_suppressed.fetch_add(1, std::memory_order_relaxed);
-      char logbuf[96];
-      snprintf(logbuf, sizeof(logbuf), "item_hooks: suppress estus restock id=0x%X qty=%d", id, qty);
-      LogWrite(logbuf);
+      (void)qty;
       continue;
     }
     g_acquired.fetch_add(1, std::memory_order_relaxed);

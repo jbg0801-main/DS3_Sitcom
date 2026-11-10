@@ -27,6 +27,8 @@ class EventDetector {
   std::uint64_t gameplay_seeded_ms_ = 0;
   std::uint64_t pending_hit_laugh_ms_ = 0;
   std::uint64_t last_wipe_ms_ = 0;
+  bool pending_wipe_ = false;
+  std::int32_t last_shown_place_id_ = -1;
   std::uint64_t last_anim_probe_ms_ = 0;
   bool loading_from_gameplay_ = false;
   bool spawn_load_seen_ = false;

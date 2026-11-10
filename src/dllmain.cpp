@@ -2,10 +2,9 @@
 #include "config.h"
 #include "credit.h"
 #include "dinput8_proxy.h"
-#include "estus_hooks.h"
-#include "area_title_hooks.h"
 #include "events.h"
 #include "fmod_volume.h"
+#include "game_hooks.h"
 #include "game_state.h"
 #include "item_hooks.h"
 #include "log.h"
@@ -100,8 +99,7 @@ DWORD WINAPI WorkerMain(LPVOID) {
   CreditEnsureHook();
 
   ItemHooksInit();
-  EstusHooksInit();
-  AreaTitleHooksInit();
+  GameHooksInit();
 
   // Attach FMOD only after the game is up — IAT/inline hooks, no LoadLibrary, no probes.
   if (FmodVolumeInit()) {
@@ -120,7 +118,6 @@ DWORD WINAPI WorkerMain(LPVOID) {
   std::uint64_t ticks = 0;
   float last_logged_sfx = -1.f;
   bool startup_laugh_pending = true;
-  std::uint64_t last_sfx_change_ms = 0;
   const std::uint64_t worker_start_ms = static_cast<std::uint64_t>(GetTickCount64());
   while (g_running) {
     const GameSnapshot snap = game.Read();
@@ -133,24 +130,17 @@ DWORD WINAPI WorkerMain(LPVOID) {
       if (std::fabs(sfx - last_logged_sfx) > 0.01f) {
         LogWrite("audio: FMOD SE volume=" + std::to_string(sfx));
         last_logged_sfx = sfx;
-        last_sfx_change_ms = now_ms;
       }
     } else {
       audio.SetGameSfxVolume(1.f);
     }
 
+    // Boot-logo smoke test: play once early so it lands on the first publisher
+    // logos, not after a 20s timeout mid-gameplay.
     if (startup_laugh_pending) {
       const auto elapsed = now_ms - worker_start_ms;
-      const auto sfx_stable_ms =
-          last_sfx_change_ms != 0 ? (now_ms - last_sfx_change_ms) : 0;
-      const bool sfx_settled = sfx_ok && sfx_stable_ms >= 8000;
-      const bool title_ready = snap.on_title_screen && !snap.is_loading;
-      if (title_ready && sfx_settled) {
-        LogWrite("worker: playing startup laugh smoke-test (title+sfx settled 8s, PlaySound)");
-        audio.PlayTitleSmokeTest(SoundCategory::Laugh);
-        startup_laugh_pending = false;
-      } else if (elapsed >= 20000) {
-        LogWrite("worker: playing startup laugh smoke-test (timeout)");
+      if (elapsed >= 1500) {
+        LogWrite("worker: playing startup laugh smoke-test (boot logos, PlaySound)");
         audio.PlayTitleSmokeTest(SoundCategory::Laugh);
         startup_laugh_pending = false;
       }
@@ -198,8 +188,7 @@ DWORD WINAPI WorkerMain(LPVOID) {
 
   CreditShutdown();
   ItemHooksShutdown();
-  EstusHooksShutdown();
-  AreaTitleHooksShutdown();
+  GameHooksShutdown();
   game.Shutdown();
   audio.Shutdown();
   FmodVolumeShutdown();
